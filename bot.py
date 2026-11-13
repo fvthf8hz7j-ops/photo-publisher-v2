@@ -314,6 +314,16 @@ async def back_to_subjects(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return SUBJECT
 
 
+async def remind_choose_subject(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Выбери предмет кнопкой выше.")
+    return SUBJECT
+
+
+async def remind_choose_teacher(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Выбери преподавателя кнопкой выше.")
+    return TEACHER
+
+
 async def back_to_edit_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
