@@ -1,10 +1,22 @@
 import os
 import logging
 
-from telegram import Update, InputMediaPhoto, ReplyKeyboardMarkup, ReplyKeyboardRemove
+from telegram import (
+    Update,
+    InputMediaPhoto,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
+)
 from telegram.ext import (
-    Application, CommandHandler, MessageHandler,
-    ContextTypes, ConversationHandler, filters
+    Application,
+    CallbackQueryHandler,
+    CommandHandler,
+    MessageHandler,
+    ContextTypes,
+    ConversationHandler,
+    filters,
 )
 
 PHOTOS, WORK_TYPE, SUBJECT, TEACHER = range(4)
@@ -12,8 +24,74 @@ PHOTOS, WORK_TYPE, SUBJECT, TEACHER = range(4)
 TOKEN = os.getenv("BOT_TOKEN")
 TARGET_CHAT_ID = int(os.getenv("TARGET_CHAT_ID", "0"))
 
+TEACHERS_BY_SUBJECT = {
+    "Алгебра": [
+        "Городнов Артем Михайлович",
+        "Любецкая Елена Васильевна",
+        "Неустроев Глеб Александрович",
+        "Петров Алексей Владимирович",
+    ],
+    "Биология": ["Майчак Вера Валерьевна"],
+    "География": ["Степаньков Дмитрий Викторович"],
+    "Геометрия": [
+        "Городнов Артем Михайлович",
+        "Любецкая Елена Васильевна",
+        "Неустроев Глеб Александрович",
+        "Петров Алексей Владимирович",
+    ],
+    "Информатика": [
+        "Большакова Екатерина Игоревна",
+        "Панфилова Дарья Александровна",
+    ],
+    "История": [
+        "Кадыков Александр Николаевич",
+        "Цветкова Ангелина Филипповна",
+    ],
+    "Литература": [
+        "Гаранина Екатерина Владимировна",
+        "Ишутин Юрий Юрьевич",
+    ],
+    "Обществознание": ["Егорова Айгюль Николаевна"],
+    "Право": [
+        "Степанова Софья Алексеевна",
+        "Юсупов Андрей Витальевич",
+    ],
+    "Русский язык": [
+        "Борисова Елена Олеговна",
+        "Гаранина Екатерина Владимировна",
+    ],
+    "Теория познания": ["Курилович Иван Сергеевич"],
+    "Физика": [
+        "Белянин Василий Николаевич",
+        "Кочегаров Александр Александрович",
+    ],
+    "Химия": ["Кивгазова Полина Владимировна"],
+    "Экономика": ["Нимерницкая Ирина Андреевна"],
+}
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+
+def subject_keyboard():
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton(subject, callback_data=f"subject:{index}")]
+            for index, subject in enumerate(TEACHERS_BY_SUBJECT)
+        ]
+    )
+
+
+def teacher_keyboard(subject: str):
+    teachers = TEACHERS_BY_SUBJECT[subject]
+    buttons = [
+        [InlineKeyboardButton(teacher, callback_data=f"teacher:{index}")]
+        for index, teacher in enumerate(teachers)
+    ]
+    buttons.append(
+        [InlineKeyboardButton("⬅️ Другой предмет", callback_data="subject:back")]
+    )
+    return InlineKeyboardMarkup(buttons)
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -63,24 +141,76 @@ async def finish_photos(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def receive_work_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["work_type"] = update.message.text.strip()
-    await update.message.reply_text("По какому предмету эта работа? 📚")
+    await update.message.reply_text(
+        "Выбери предмет работы. 📚",
+        reply_markup=subject_keyboard()
+    )
     return SUBJECT
 
 
 async def receive_subject(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["subject"] = update.message.text.strip()
-    await update.message.reply_text("Назови учителя по этому предмету. 👩‍🏫")
+    query = update.callback_query
+    subject_index = int(query.data.split(":", 1)[1])
+    subjects = list(TEACHERS_BY_SUBJECT)
+
+    if subject_index >= len(subjects):
+        await query.answer("Список предметов обновился. Начни заново: /start", show_alert=True)
+        return ConversationHandler.END
+
+    await query.answer()
+    subject = subjects[subject_index]
+    context.user_data["subject"] = subject
+
+    await query.edit_message_text(
+        f"Предмет: {subject}\nВыбери преподавателя:",
+        reply_markup=teacher_keyboard(subject)
+    )
+    return TEACHER
+
+
+async def back_to_subjects(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text(
+        "Выбери предмет работы. 📚",
+        reply_markup=subject_keyboard()
+    )
+    return SUBJECT
+
+
+async def remind_choose_subject(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Выбери предмет кнопкой выше.")
+    return SUBJECT
+
+
+async def remind_choose_teacher(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Выбери преподавателя кнопкой выше.")
     return TEACHER
 
 
 async def receive_teacher(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    teacher = update.message.text.strip()
+    query = update.callback_query
+    subject = context.user_data.get("subject")
+    teachers = TEACHERS_BY_SUBJECT.get(subject, [])
+    teacher_index = int(query.data.split(":", 1)[1])
+
+    if teacher_index >= len(teachers):
+        await query.answer("Список преподавателей обновился. Начни заново: /start", show_alert=True)
+        return ConversationHandler.END
+
+    await query.answer()
+    teacher = teachers[teacher_index]
+    context.user_data["teacher"] = teacher
     photos = context.user_data["photos"]
+
+    await query.edit_message_text(
+        f"Выбран преподаватель: {teacher}\nОтправляю работу…"
+    )
 
     caption = (
         "📄 Новая работа\n\n"
         f"Тип: {context.user_data['work_type']}\n"
-        f"Предмет: {context.user_data['subject']}\n"
+        f"Предмет: {subject}\n"
         f"Учитель: {teacher}"
     )
 
@@ -110,12 +240,12 @@ async def receive_teacher(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     except Exception:
         logger.exception("Ошибка публикации")
-        await update.message.reply_text(
+        await query.message.reply_text(
             "Не удалось опубликовать работу. Обратись к администратору."
         )
         return ConversationHandler.END
 
-    await update.message.reply_text("Спасибо, работа отправлена! 🌸")
+    await query.message.reply_text("Спасибо, работа отправлена! 🌸")
     context.user_data.clear()
     return ConversationHandler.END
 
@@ -146,10 +276,13 @@ def main():
                 MessageHandler(filters.TEXT & ~filters.COMMAND, receive_work_type)
             ],
             SUBJECT: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_subject)
+                CallbackQueryHandler(receive_subject, pattern=r"^subject:\d+$"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, remind_choose_subject),
             ],
             TEACHER: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_teacher)
+                CallbackQueryHandler(back_to_subjects, pattern=r"^subject:back$"),
+                CallbackQueryHandler(receive_teacher, pattern=r"^teacher:\d+$"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, remind_choose_teacher),
             ],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
