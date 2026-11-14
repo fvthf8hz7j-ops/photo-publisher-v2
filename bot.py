@@ -19,7 +19,7 @@ from telegram.ext import (
     filters,
 )
 
-PHOTOS, WORK_TYPE, SUBJECT, TEACHER, PREVIEW, EDIT_MENU, EDIT_WORK_TYPE, ADD_PHOTOS, DELETE_PHOTOS = range(9)
+PHOTOS, WORK_TYPE, SUBJECT, TEACHER, PREVIEW, EDIT_MENU, EDIT_WORK_TYPE, ADD_PHOTOS, DELETE_PHOTOS, CUSTOM_SUBJECT, CUSTOM_TEACHER = range(11)
 
 TOKEN = os.getenv("BOT_TOKEN")
 TARGET_CHAT_ID = int(os.getenv("TARGET_CHAT_ID", "0"))
@@ -80,6 +80,7 @@ def subject_keyboard(show_edit_back=False):
         [InlineKeyboardButton(subject, callback_data=f"subject:{index}")]
         for index, subject in enumerate(TEACHERS_BY_SUBJECT)
     ]
+    buttons.append([InlineKeyboardButton("Другое", callback_data="subject:other")])
     if show_edit_back:
         buttons.append(
             [InlineKeyboardButton("⬅️ Вернуться к редактированию", callback_data="subject:edit_back")]
@@ -314,6 +315,51 @@ async def back_to_subjects(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return SUBJECT
 
 
+async def start_custom_subject(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not context.user_data.get("preview_message_id"):
+        context.user_data["preview_message_id"] = query.message.message_id
+    context.user_data["summary_is_preview"] = False
+    await query.edit_message_text("Напиши название предмета:")
+    return CUSTOM_SUBJECT
+
+
+async def receive_custom_subject(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    subject = update.message.text.strip()
+    if not subject:
+        await update.message.reply_text("Напиши название предмета.")
+        return CUSTOM_SUBJECT
+
+    context.user_data["subject"] = subject
+    await context.bot.edit_message_text(
+        chat_id=update.effective_chat.id,
+        message_id=context.user_data["preview_message_id"],
+        text="Теперь напиши имя преподавателя:",
+    )
+    return CUSTOM_TEACHER
+
+
+async def receive_custom_teacher(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    teacher = update.message.text.strip()
+    if not teacher:
+        await update.message.reply_text("Напиши имя преподавателя.")
+        return CUSTOM_TEACHER
+
+    context.user_data["teacher"] = teacher
+    context.user_data["chat_id"] = update.effective_chat.id
+    context.user_data["summary_is_preview"] = False
+    context.user_data.pop("subject_before_edit", None)
+    context.user_data.pop("teacher_before_edit", None)
+    await context.bot.edit_message_text(
+        chat_id=context.user_data["chat_id"],
+        message_id=context.user_data["preview_message_id"],
+        text="Готовлю предпросмотр…",
+    )
+    await show_preview(context)
+    return PREVIEW
+
+
 async def remind_choose_subject(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Выбери предмет кнопкой выше.")
     return SUBJECT
@@ -409,6 +455,10 @@ async def edit_teacher(update: Update, context: ContextTypes.DEFAULT_TYPE):
     subject = context.user_data["subject"]
     await query.answer()
     context.user_data["summary_is_preview"] = False
+    if subject not in TEACHERS_BY_SUBJECT:
+        await query.edit_message_text("Напиши имя нового преподавателя:")
+        return CUSTOM_TEACHER
+
     await query.edit_message_text(
         f"Выбери нового преподавателя по предмету «{subject}»:",
         reply_markup=teacher_keyboard(subject),
@@ -630,6 +680,7 @@ def main():
             ],
             SUBJECT: [
                 CallbackQueryHandler(receive_subject, pattern=r"^subject:\d+$"),
+                CallbackQueryHandler(start_custom_subject, pattern=r"^subject:other$"),
                 CallbackQueryHandler(back_to_edit_menu, pattern=r"^subject:edit_back$"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, remind_choose_subject),
             ],
@@ -637,6 +688,12 @@ def main():
                 CallbackQueryHandler(back_to_subjects, pattern=r"^subject:back$"),
                 CallbackQueryHandler(receive_teacher, pattern=r"^teacher:\d+$"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, remind_choose_teacher),
+            ],
+            CUSTOM_SUBJECT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_custom_subject),
+            ],
+            CUSTOM_TEACHER: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_custom_teacher),
             ],
             PREVIEW: [
                 CallbackQueryHandler(publish_submission, pattern=r"^preview:publish$"),
