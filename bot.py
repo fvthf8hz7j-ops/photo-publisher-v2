@@ -1,5 +1,8 @@
-import os
+import asyncio
+import json
 import logging
+import os
+from pathlib import Path
 
 from telegram import (
     Update,
@@ -9,6 +12,7 @@ from telegram import (
     ReplyKeyboardMarkup,
     ReplyKeyboardRemove,
 )
+from telegram.error import Forbidden, RetryAfter, TelegramError
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -23,6 +27,7 @@ PHOTOS, WORK_TYPE, SUBJECT, TEACHER, PREVIEW, EDIT_MENU, EDIT_WORK_TYPE, ADD_PHO
 
 TOKEN = os.getenv("BOT_TOKEN")
 TARGET_CHAT_ID = int(os.getenv("TARGET_CHAT_ID", "0"))
+ADMIN_USER_ID = os.getenv("ADMIN_USER_ID", "").strip()
 
 TEACHERS_BY_SUBJECT = {
     "Алгебра": [
@@ -73,6 +78,80 @@ logging.basicConfig(level=logging.INFO)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
+
+DATA_DIR = Path(os.getenv("DATA_DIR", "/app/data"))
+SUBSCRIBERS_FILE = DATA_DIR / "subscribers.json"
+
+
+def load_subscriber_state():
+    try:
+        data = json.loads(SUBSCRIBERS_FILE.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return set(), set()
+    except (OSError, json.JSONDecodeError) as error:
+        logger.error("Could not read subscriber list (%s)", type(error).__name__)
+        return set(), set()
+
+    if not isinstance(data, dict):
+        return set(), set()
+
+    def parse_ids(key):
+        ids = set()
+        for value in data.get(key, []):
+            try:
+                ids.add(int(value))
+            except (TypeError, ValueError):
+                continue
+        return ids
+
+    return parse_ids("chat_ids"), parse_ids("unsubscribed_chat_ids")
+
+
+SUBSCRIBERS, UNSUBSCRIBED_CHAT_IDS = load_subscriber_state()
+
+
+def save_subscriber_state():
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        temporary_file = SUBSCRIBERS_FILE.with_suffix(".tmp")
+        temporary_file.write_text(
+            json.dumps({
+                "chat_ids": sorted(SUBSCRIBERS),
+                "unsubscribed_chat_ids": sorted(UNSUBSCRIBED_CHAT_IDS),
+            }),
+            encoding="utf-8",
+        )
+        os.chmod(temporary_file, 0o600)
+        os.replace(temporary_file, SUBSCRIBERS_FILE)
+    except OSError as error:
+        logger.error("Could not save subscriber list (%s)", type(error).__name__)
+
+
+def subscribe_chat(chat_id):
+    changed = chat_id in UNSUBSCRIBED_CHAT_IDS or chat_id not in SUBSCRIBERS
+    UNSUBSCRIBED_CHAT_IDS.discard(chat_id)
+    SUBSCRIBERS.add(chat_id)
+    if changed:
+        save_subscriber_state()
+
+
+def unsubscribe_chat(chat_id):
+    changed = chat_id not in UNSUBSCRIBED_CHAT_IDS or chat_id in SUBSCRIBERS
+    SUBSCRIBERS.discard(chat_id)
+    UNSUBSCRIBED_CHAT_IDS.add(chat_id)
+    if changed:
+        save_subscriber_state()
+
+
+async def remember_private_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    if (
+        chat
+        and chat.type == "private"
+        and chat.id not in UNSUBSCRIBED_CHAT_IDS
+        and chat.id not in SUBSCRIBERS
+    ):
+        subscribe_chat(chat.id)
 
 
 def subject_keyboard(show_edit_back=False):
@@ -231,6 +310,8 @@ async def show_preview(context: ContextTypes.DEFAULT_TYPE):
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat and update.effective_chat.type == "private":
+        subscribe_chat(update.effective_chat.id)
     context.user_data.clear()
     context.user_data["photos"] = []
     context.user_data["chat_id"] = update.effective_chat.id
@@ -240,7 +321,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Привет! 👋\n\n"
         "Отправь фотографии своей работы.\n"
         "Количество фотографий не ограничено.\n"
-        "Когда закончишь, нажми «Готово».",
+        "Когда закончишь, нажми «Готово».\n\n"
+        "Отказаться от объявлений можно командой /stop.",
         reply_markup=keyboard,
     )
     return PHOTOS
@@ -662,6 +744,99 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
+async def show_my_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_user or not update.effective_chat:
+        return
+    if update.effective_chat.type != "private":
+        await update.effective_message.reply_text("Напиши /myid в личном чате с ботом.")
+        return
+    await update.effective_message.reply_text(
+        f"Твой Telegram ID: {update.effective_user.id}"
+    )
+
+
+async def stop_notifications(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat and update.effective_chat.type == "private":
+        unsubscribe_chat(update.effective_chat.id)
+        await update.effective_message.reply_text(
+            "Рассылки отключены. Чтобы снова подписаться, отправь /start."
+        )
+    else:
+        await update.effective_message.reply_text(
+            "Отключить рассылки можно в личном чате с ботом."
+        )
+
+
+async def broadcast_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.effective_message
+    user = update.effective_user
+    chat = update.effective_chat
+    if not message or not user or not chat or chat.type != "private":
+        if message:
+            await message.reply_text("Команду /broadcast используй в личном чате с ботом.")
+        return
+
+    if not ADMIN_USER_ID or str(user.id) != ADMIN_USER_ID:
+        await message.reply_text("Эта команда доступна только администратору.")
+        return
+
+    parts = (message.text or "").split(maxsplit=1)
+    text = parts[1].strip() if len(parts) > 1 else ""
+    if not text:
+        await message.reply_text("Формат команды: /broadcast текст сообщения")
+        return
+    if len(text) > 4096:
+        await message.reply_text("Сообщение слишком длинное — максимум 4096 символов.")
+        return
+
+    recipients = sorted(SUBSCRIBERS - {chat.id})
+    if not recipients:
+        await message.reply_text(
+            "Пока некому отправить сообщение. Пользователям нужно открыть бота и отправить /start."
+        )
+        return
+
+    sent = 0
+    failed = 0
+    blocked = 0
+    await message.reply_text(f"Начинаю рассылку: {len(recipients)} получателей.")
+
+    for chat_id in recipients:
+        try:
+            await context.bot.send_message(chat_id=chat_id, text=text)
+            sent += 1
+        except RetryAfter as error:
+            retry_after = error.retry_after
+            if hasattr(retry_after, "total_seconds"):
+                retry_after = retry_after.total_seconds()
+            await asyncio.sleep(float(retry_after) + 0.1)
+            try:
+                await context.bot.send_message(chat_id=chat_id, text=text)
+                sent += 1
+            except Forbidden:
+                SUBSCRIBERS.discard(chat_id)
+                blocked += 1
+            except TelegramError as retry_error:
+                logger.warning(
+                    "Broadcast delivery failed (%s)",
+                    type(retry_error).__name__,
+                )
+                failed += 1
+        except Forbidden:
+            SUBSCRIBERS.discard(chat_id)
+            blocked += 1
+        except TelegramError as error:
+            logger.warning("Broadcast delivery failed (%s)", type(error).__name__)
+            failed += 1
+        await asyncio.sleep(0.05)
+
+    if blocked:
+        save_subscriber_state()
+    await message.reply_text(
+        f"Рассылка завершена. Доставлено: {sent}; не доставлено: {failed + blocked}."
+    )
+
+
 def main():
     if not TOKEN or not TARGET_CHAT_ID:
         raise RuntimeError("Не заданы настройки бота")
@@ -727,6 +902,13 @@ def main():
     )
 
     app.add_handler(conversation)
+    app.add_handler(
+        MessageHandler(filters.ALL, remember_private_user),
+        group=-1,
+    )
+    app.add_handler(CommandHandler("myid", show_my_id), group=1)
+    app.add_handler(CommandHandler("stop", stop_notifications), group=1)
+    app.add_handler(CommandHandler("broadcast", broadcast_message), group=1)
 
     print("Photo Publisher запущен!")
     app.run_polling()
