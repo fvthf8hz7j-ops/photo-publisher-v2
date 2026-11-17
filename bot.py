@@ -15,6 +15,7 @@ from telegram import (
 from telegram.error import Forbidden, RetryAfter, TelegramError
 from telegram.ext import (
     Application,
+    ApplicationHandlerStop,
     CallbackQueryHandler,
     CommandHandler,
     MessageHandler,
@@ -23,11 +24,13 @@ from telegram.ext import (
     filters,
 )
 
-PHOTOS, WORK_TYPE, SUBJECT, TEACHER, PREVIEW, EDIT_MENU, EDIT_WORK_TYPE, ADD_PHOTOS, DELETE_PHOTOS, CUSTOM_SUBJECT, CUSTOM_TEACHER = range(11)
+PHOTOS, WORK_TYPE, SUBJECT, TEACHER, PREVIEW, EDIT_MENU, EDIT_WORK_TYPE, ADD_PHOTOS, DELETE_PHOTOS, CUSTOM_SUBJECT, CUSTOM_TEACHER, CONTACT_ADMIN = range(12)
 
 TOKEN = os.getenv("BOT_TOKEN")
 TARGET_CHAT_ID = int(os.getenv("TARGET_CHAT_ID", "0"))
 ADMIN_USER_ID = os.getenv("ADMIN_USER_ID", "").strip()
+CONTACT_ADMIN_TEXT = "👤 Связаться с админом"
+END_CONTACT_TEXT = "Закончить связь"
 
 TEACHERS_BY_SUBJECT = {
     "Алгебра": [
@@ -81,6 +84,39 @@ logger = logging.getLogger(__name__)
 
 DATA_DIR = Path(os.getenv("DATA_DIR", "/app/data"))
 SUBSCRIBERS_FILE = DATA_DIR / "subscribers.json"
+SUPPORT_ROUTES_FILE = DATA_DIR / "support_routes.json"
+
+
+def load_support_routes():
+    try:
+        data = json.loads(SUPPORT_ROUTES_FILE.read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, json.JSONDecodeError):
+        return {}
+
+    if not isinstance(data, dict):
+        return {}
+
+    routes = {}
+    for message_id, user_chat_id in data.items():
+        try:
+            routes[str(int(message_id))] = int(user_chat_id)
+        except (TypeError, ValueError):
+            continue
+    return routes
+
+
+SUPPORT_ROUTES = load_support_routes()
+
+
+def save_support_routes():
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        temporary_file = SUPPORT_ROUTES_FILE.with_suffix(".tmp")
+        temporary_file.write_text(json.dumps(SUPPORT_ROUTES), encoding="utf-8")
+        os.chmod(temporary_file, 0o600)
+        os.replace(temporary_file, SUPPORT_ROUTES_FILE)
+    except OSError as error:
+        logger.error("Could not save support routes (%s)", type(error).__name__)
 
 
 def load_subscriber_state():
@@ -141,6 +177,17 @@ def unsubscribe_chat(chat_id):
     UNSUBSCRIBED_CHAT_IDS.add(chat_id)
     if changed:
         save_subscriber_state()
+
+
+def photo_collection_keyboard():
+    return ReplyKeyboardMarkup(
+        [["Готово", CONTACT_ADMIN_TEXT]],
+        resize_keyboard=True,
+    )
+
+
+def end_contact_keyboard():
+    return ReplyKeyboardMarkup([[END_CONTACT_TEXT]], resize_keyboard=True)
 
 
 async def remember_private_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -316,12 +363,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["photos"] = []
     context.user_data["chat_id"] = update.effective_chat.id
 
-    keyboard = ReplyKeyboardMarkup([["Готово"]], resize_keyboard=True)
+    keyboard = photo_collection_keyboard()
     await update.message.reply_text(
         "Привет! 👋\n\n"
         "Отправь фотографии своей работы.\n"
         "Количество фотографий не ограничено.\n"
-        "Когда закончишь, нажми «Готово».\n\n"
+        "Когда закончишь, нажми «Готово».\n"
+        "Чтобы задать вопрос, нажми «Связаться с админом».\n\n"
         "Отказаться от объявлений можно командой /stop.",
         reply_markup=keyboard,
     )
@@ -336,6 +384,98 @@ async def receive_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Можешь отправить ещё или нажать «Готово»."
     )
     return PHOTOS
+
+
+async def open_admin_contact(update: Update, context: ContextTypes.DEFAULT_TYPE, return_state: int):
+    try:
+        admin_chat_id = int(ADMIN_USER_ID)
+    except (TypeError, ValueError):
+        await update.message.reply_text(
+            "Связь с администратором пока не настроена. Попробуй позже.",
+            reply_markup=photo_collection_keyboard(),
+        )
+        return return_state
+
+    if update.effective_chat.id == admin_chat_id:
+        await update.message.reply_text(
+            "Эта кнопка предназначена для вопросов администратору.",
+            reply_markup=photo_collection_keyboard(),
+        )
+        return return_state
+
+    context.user_data["support_return_state"] = return_state
+    await update.message.reply_text(
+        "Напиши сообщение администратору. Текст, фото и файлы будут переданы ему. "
+        "Когда закончишь, нажми «Закончить связь».",
+        reply_markup=end_contact_keyboard(),
+    )
+    return CONTACT_ADMIN
+
+
+async def open_admin_contact_from_photos(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    return await open_admin_contact(update, context, PHOTOS)
+
+
+async def open_admin_contact_from_additional_photos(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    return await open_admin_contact(update, context, ADD_PHOTOS)
+
+
+async def finish_admin_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    return_state = context.user_data.pop("support_return_state", PHOTOS)
+    await update.message.reply_text(
+        "Связь с администратором завершена. Можешь продолжить отправку фотографий.",
+        reply_markup=photo_collection_keyboard(),
+    )
+    return return_state
+
+
+async def send_support_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.effective_message
+    user = update.effective_user
+    chat = update.effective_chat
+    try:
+        admin_chat_id = int(ADMIN_USER_ID)
+    except (TypeError, ValueError):
+        await message.reply_text(
+            "Связь с администратором пока не настроена.",
+            reply_markup=end_contact_keyboard(),
+        )
+        return CONTACT_ADMIN
+
+    name = user.full_name if user else "Пользователь"
+    if user and user.username:
+        name += f" (@{user.username})"
+    if user:
+        name += f"\nTelegram ID: {user.id}"
+
+    try:
+        await context.bot.send_message(
+            chat_id=admin_chat_id,
+            text=(
+                f"✉️ Сообщение от {name}\n"
+                "Ответь на сообщение ниже — бот передаст ответ ученику."
+            ),
+        )
+        copied = await context.bot.copy_message(
+            chat_id=admin_chat_id,
+            from_chat_id=chat.id,
+            message_id=message.message_id,
+        )
+    except TelegramError as error:
+        logger.warning("Could not deliver support message (%s)", type(error).__name__)
+        await message.reply_text(
+            "Не получилось передать сообщение. Попробуй ещё раз чуть позже.",
+            reply_markup=end_contact_keyboard(),
+        )
+        return CONTACT_ADMIN
+
+    SUPPORT_ROUTES[str(copied.message_id)] = chat.id
+    save_support_routes()
+    await message.reply_text(
+        "Сообщение передано администратору. Можешь написать ещё или закончить связь.",
+        reply_markup=end_contact_keyboard(),
+    )
+    return CONTACT_ADMIN
 
 
 async def finish_photos(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -559,7 +699,7 @@ async def add_photos(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await query.message.reply_text(
         "Жду фотографии. Когда закончишь, нажми «Готово».",
-        reply_markup=ReplyKeyboardMarkup([["Готово"]], resize_keyboard=True),
+        reply_markup=photo_collection_keyboard(),
     )
     return ADD_PHOTOS
 
@@ -570,7 +710,7 @@ async def receive_additional_photo(update: Update, context: ContextTypes.DEFAULT
     await update.message.reply_text(
         f"Фото добавлено! 📸 Всего фотографий: {count}.\n"
         "Можешь отправить ещё или нажать «Готово».",
-        reply_markup=ReplyKeyboardMarkup([["Готово"]], resize_keyboard=True),
+        reply_markup=photo_collection_keyboard(),
     )
     return ADD_PHOTOS
 
@@ -767,6 +907,39 @@ async def stop_notifications(update: Update, context: ContextTypes.DEFAULT_TYPE)
         )
 
 
+async def route_admin_support_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.effective_message
+    user = update.effective_user
+    chat = update.effective_chat
+    if (
+        not message
+        or not user
+        or not chat
+        or not ADMIN_USER_ID
+        or str(user.id) != ADMIN_USER_ID
+        or not message.reply_to_message
+        or (message.text or "").startswith("/")
+    ):
+        return
+
+    target_chat_id = SUPPORT_ROUTES.get(str(message.reply_to_message.message_id))
+    if not target_chat_id:
+        return
+
+    try:
+        await context.bot.copy_message(
+            chat_id=target_chat_id,
+            from_chat_id=chat.id,
+            message_id=message.message_id,
+        )
+    except TelegramError as error:
+        logger.warning("Could not deliver admin reply (%s)", type(error).__name__)
+        await message.reply_text("Не удалось передать ответ ученику.")
+    else:
+        await message.reply_text("Ответ отправлен ученику.")
+    raise ApplicationHandlerStop
+
+
 async def broadcast_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.effective_message
     user = update.effective_user
@@ -849,6 +1022,11 @@ def main():
             PHOTOS: [
                 MessageHandler(filters.PHOTO, receive_photo),
                 MessageHandler(filters.Regex(r"^Готово$"), finish_photos),
+                MessageHandler(filters.Regex(r"^👤 Связаться с админом$"), open_admin_contact_from_photos),
+            ],
+            CONTACT_ADMIN: [
+                MessageHandler(filters.Regex(r"^Закончить связь$"), finish_admin_contact),
+                MessageHandler(filters.ALL & ~filters.COMMAND, send_support_message),
             ],
             WORK_TYPE: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, receive_work_type),
@@ -890,6 +1068,7 @@ def main():
             ADD_PHOTOS: [
                 MessageHandler(filters.PHOTO, receive_additional_photo),
                 MessageHandler(filters.Regex(r"^Готово$"), finish_additional_photos),
+                MessageHandler(filters.Regex(r"^👤 Связаться с админом$"), open_admin_contact_from_additional_photos),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, remind_add_photos),
             ],
             DELETE_PHOTOS: [
@@ -901,6 +1080,13 @@ def main():
         allow_reentry=True,
     )
 
+    app.add_handler(
+        MessageHandler(
+            filters.ChatType.PRIVATE & filters.REPLY,
+            route_admin_support_reply,
+        ),
+        group=-2,
+    )
     app.add_handler(conversation)
     app.add_handler(
         MessageHandler(filters.ALL, remember_private_user),
